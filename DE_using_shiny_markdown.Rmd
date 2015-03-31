@@ -1,0 +1,224 @@
+---
+title: "RNA-seq Differential Expression Report using Shiny/Markdown"
+author: "Keith Decker"
+date: "3/11/2015"
+output: html_document
+runtime: shiny
+description: Demo showing how shiny and markdown can be used to create an interactive report for RNAseq analysis using the edgeR and GOseq packages
+---
+
+### Code block 1: Load in case study data from Li et al. and display summary data
+  * 3 Backticks to define start and end of Rmarkdown code block
+  * Use cache=TRUE so that we don't have to keep reloading data
+  * Use edgeR package for differential expression and goseq package for gene ontology
+  * Use sample RNA-seq data provided in the goseq vignette (Li et al, 2008)
+  * Use suppressMessages around library call to prevent verbose output
+```{r load packages and build edgeR object,messages=FALSE,cache=TRUE}
+#  Load required packages from bioconductor
+suppressMessages(library(edgeR))
+suppressMessages(library(goseq))
+suppressMessages(library("org.Hs.eg.db")) # get GO annotations for human
+#  Load required packages from cran
+suppressMessages(library(knitr))
+suppressMessages(library(shiny))
+suppressMessages(library(data.table)) # for fast table operations
+
+#  Create edgeR DGE object based on Li data
+table.summary=read.table(system.file("extdata","Li_sum.txt",package='goseq'),sep='\t',header=TRUE,stringsAsFactors=FALSE) # Load data provided in vignette
+#  Create a count table in the format expected by edgeR
+counts=table.summary[,-1]
+rownames(counts)=table.summary[,1]
+#  Define group membership of the RNAseq samples 
+grp=factor(rep(c("Control","Treated"),times=c(4,3)))
+edgerDEobj=DGEList(counts,lib.size=colSums(counts),group=grp) # Create DGEList object for DE using edgeR
+```
+### Code block 2: Display summary of RNAseq count data using shiny renderTable
+  * shiny wellPanel provides good option to distinguish code from output
+```{r display RNAseq data summary,messages=FALSE,cache=FALSE}
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+          h3("Summary of RNAseq count data",style = "color:blue",align = "left"),
+          renderTable({t(edgerDEobj$samples[,c("group","lib.size")])})
+)
+```
+
+### Code block 3: Do some simple QC to confirm replicates are consistent
+  * Use shiny renderPlot to create plot
+  * Use arguments width=500,height=500 to control size of plot in pixels
+```{r MDS plot,cache=FALSE}
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+          h3("MDS plot for sample QC",style = "color:blue",align = "left"),
+          renderPlot({
+            COL = ifelse(edgerDEobj$samples$group=="Control","red","black") # Create colors based on group membership
+            #  Multi dimensional scaling plot 
+            MDS=plotMDS(edgerDEobj,col=COL,xlab='Dimension 1',ylab='Dimension 2',xlim=c(-2,3),ylim=c(-3,2),top=100,labels=gsub("lane","L",row.names(edgerDEobj$samples)),cex.axis=1.5,cex.lab=1.5,cex.main=2,cex=2); #Using top 100 genes for MDS so sample labels are easy to see
+            legend("bottom",c("Control","Treated"),text.col=c("red","black"),cex=2,bg="white",bty = "o",text.font=1)
+          },width=500,height=500)
+)
+```
+
+### Code block 4: Get edgeR differential expression stats
+  * Use data.table for fast merging of expression and annotation data
+  * Use warning=FALSE to suppress warnings within a code block
+```{r Create differential expression table,cache=TRUE,warning=FALSE}
+# Do statistical tests in edgeR
+edgerDEobj=estimateCommonDisp(edgerDEobj)
+edgerDEobj=estimateTagwiseDisp(edgerDEobj)
+tested=exactTest(edgerDEobj)
+DEtable = tested$table
+# Do multi-test correction
+DEtable$Padjust = p.adjust(DEtable$PValue,method="BH")
+# Create a table for display
+DEtable = cbind(GeneNames=row.names(DEtable),DEtable)
+DEtable = DEtable[order(DEtable$Padjust),]
+DEtable = data.table(DEtable)
+# Get annotation info for human genes from Bioconductor database
+ensg_to_info = suppressMessages(select(org.Hs.eg.db,keys = rownames(counts),columns=c("ENSEMBL","SYMBOL","GENENAME"),keytype="ENSEMBL"))
+colnames(ensg_to_info ) = c("GeneNames","Symbol","Description")
+ensg_to_info = data.table(ensg_to_info)
+# Some ensembl IDs have multiple associated symbols/names.  If so, collapse to a single entry
+ensg_to_info = ensg_to_info[,list(Symbol=paste(Symbol,collapse=","),Description=paste(Description,collapse=",")),by=c("GeneNames")]
+# Merge DE and ensembl data
+DEtable = merge(DEtable,ensg_to_info,by="GeneNames",all.x=TRUE)
+DEtable = data.frame(DEtable)
+```
+
+### Code block 5:  Allow user to choose parameters for defining differentially expressed genes, then call genes as Up/Down/NC
+  * Use shiny wellPanel to markoff shiny user input widgets via color formatting
+  * Use actionButton and isolate blocks so that we can change multiple parameters and then update results
+    * without actionButton/isolate, subsequent analysis will update each time a user updates a single input value
+```{r Choose DE parameters, echo=TRUE}
+# Allow user input to control DE parameters
+wellPanel(style = "background-color: #D4D4E2; border-color: red ;border-width: 3px",
+    h3("Choose parameters for defining differentially expressed gene set",style = "color:black",align = "left"),
+    numericInput("FDRthresh",label="FDR threshold", 0.05, min = 0, max = 0.25),
+    numericInput("logFCthresh",label="abs(logFC) threshold", 1, min = 0),
+    numericInput("logCPMthresh",label="logCPM threshold", 5, min = 0),
+    actionButton("runAnalysis",h4("Click to run DE",style = "color:red"))
+)
+# Call gene Status as Up/Down/NC based on user supplied parameters
+getDETable = reactive({
+  #  isolate block will only be run if the 'runAnalysis' actionButton is pressed
+  input$runAnalysis
+  isolate({
+    DEtable$Status = ifelse(DEtable$Padjust < input$FDRthresh & DEtable$logCPM > input$logCPMthresh & DEtable$logFC > input$logFCthresh,"Up",ifelse(DEtable$Padjust < input$FDRthresh & DEtable$logCPM > input$logCPMthresh & DEtable$logFC < (-input$logFCthresh),"Down","NC"))
+    DEtable
+  })
+  
+})
+```
+
+## Code block 6:  Table summarizing number of differentially expressed genes
+  * Use of actionButton/isolate block ensures that table doesn't continuously update
+```{r Summarize DE genes, echo=TRUE}
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+  h3("Summary of Differentially Expressed genes",style = "color:blue",align = "left"),
+  renderTable({
+    input$runAnalysis
+    isolate({
+      DEStatustable = t(table(getDETable()$Status))
+      row.names(DEStatustable) = "Number of genes"
+      DEStatustable
+      })
+  })
+)
+```
+
+## Code block 7: MA Plot of differentially expressed genes
+```{r MA plot of DE genes, echo=TRUE}
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+  h3("MA plot of differentially expressed genes ",style = "color:blue",align = "left"),
+  renderPlot({
+    input$runAnalysis
+    isolate({
+      DE = getDETable()
+      par(mar=c(8,8,3,3))
+      plot(DE$logCPM,DE$logFC,col=ifelse(DE$Status=="NC","black","red"),pch=18,xlab="logCPM",ylab="logFC",cex.lab=2,cex.axis=1.5,main="log2 Fold Change  vs. log2 Counts per million",cex.main=1.5)
+      legend("topright",c("DE","NC"),text.col=c("red","black"),cex=3,bg="white",bty = "n",text.font=2)
+      })
+  },width=600,height=400)
+)
+```
+
+
+## Code block 8: Provide searchable table of differentially expressed genes
+  * Add options to renderDataTable to configure table see: http://www.datatables.net/reference/option/
+    * pageLength sets the default number of rows to show
+    * pagingType controls what the previous/next 
+```{r Create table of DE genes, echo=TRUE}
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+  h3("edgeR differential expression results in Treated vs. Control",style = "color:blue",align = "left"),
+  renderDataTable({
+    input$runAnalysis
+    isolate({
+      DETable = getDETable()
+      DETable =DETable[order(DETable$Padjust),]
+    })
+  },options = list(pageLength = 5,pagingType="simple"))
+)
+```
+
+## Code block 9: Calculate gene ontology categories for our differentially expressed gene set
+  * Allow user to decide whether length bias should be considered when doing DE
+  * Use isolate block so that ontology is only recalculated when DE and ontology parameters are set
+  * Use input$runOntology==0 to make sure ontology isn't run on the 1st pass
+```{r Gene ontology analysis, echo=TRUE}
+wellPanel(style = "background-color: #D4D4E2; border-color: red ;border-width: 3px",
+    h3("Settings for goseq ontology analysis",style = "color:blue",align = "left"),
+    radioButtons("LengthBias","Account for length bias", c("Yes","No"), selected = "Yes", inline = FALSE),
+    actionButton("runOntology",h4("Click to run GO analysis",style = "color:red"))
+)
+# Create probability weighting function (PWF) which accounts for the length bias in gene DE
+getPWF = reactive({
+  input$runOntology
+  #  Don't calculate ontology on the 1st pass
+  if (input$runOntology==0) return(NULL);
+  isolate({
+    DEtable = getDETable()
+    #  goseq requires a named vector of zeros (NC) and ones (DE) for all genes
+    goseqGenes = ifelse(DEtable$Status=="NC",0,1)
+    names(goseqGenes) = DEtable$GeneNames
+    pwf=nullp(goseqGenes,"hg19","ensGene")
+
+    }) 
+})
+# Create plot demonstrating the length bias of DE
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+    h3("Length bias of differentially expressed genes",style = "color:blue",align = "left"),
+    renderPlot({
+      input$runOntology
+      #  Don't calculate ontology on the 1st pass
+      if (input$runOntology==0) return(NULL);
+      isolate({
+          pwf = getPWF()
+          plotPWF(pwf,cex.axis=1.5,cex.lab=1.5)
+        })
+    },width=500,height=500)
+)
+
+# Plot ontology results
+wellPanel(style = "background-color: #D4D4E2; border-color: black ;border-width: 1px",
+    h3("Category enrichment calculated via goseq",style = "color:blue",align = "left"),
+    renderDataTable({
+      input$runOntology
+      #  Don't calculate ontology on the 1st pass
+      if (input$runOntology==0) return(NULL);
+      isolate({
+        pwf = getPWF()
+        
+        if (input$LengthBias=="Yes")
+        {
+         GO=goseq(pwf,"hg19","ensGene",method="Hypergeometric") 
+        }else{
+     
+          GO=goseq(pwf,"hg19","ensGene")
+        }
+        colnames(GO) = c("cat","over-p","under-p","CatDE","totDE","term","ontology")
+        GO
+        })
+    },options = list(pageLength = 5,pagingType="simple")) 
+)
+```
+
+
+
+
